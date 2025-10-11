@@ -105,7 +105,6 @@ setup(
         "Environment :: MacOS X",
         "Environment :: Win32 (MS Windows)",
         "Intended Audience :: Developers",
-        "License :: OSI Approved :: Python Software Foundation License",
         "Operating System :: MacOS :: MacOS X",
         "Operating System :: Microsoft :: Windows",
         "Operating System :: POSIX :: Linux",
