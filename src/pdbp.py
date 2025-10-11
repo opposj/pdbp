@@ -19,6 +19,12 @@ from inspect import signature
 from io import StringIO
 from tabcompleter import Completer, ConfigurableClass, Color
 import tabcompleter
+import _thread
+import termios
+import pty
+import tty
+import readline  # To ensure the Python readline hook go first
+import csrc._rl_patch as _rl_patch
 
 __url__ = "https://github.com/mdmintz/pdbp"
 __version__ = tabcompleter.LazyVersion("pdbp")
@@ -110,12 +116,12 @@ class DefaultConfig(object):
         colorama.just_fix_windows_console()
     prompt = "(Pdb+) "
     highlight = True
-    sticky_by_default = True
+    sticky_by_default = False
     bg = "dark"
     use_pygments = True
     colorscheme = None
     use_terminal256formatter = None  # Defaults to `"256color" in $TERM`.
-    editor = "${EDITOR:-vi}"  # Use $EDITOR if set; else default to vi.
+    editor = "${EDITOR:-vim}"  # Use $EDITOR if set; else default to vi.
     stdin_paste = None
     exec_if_unfocused = None  # This option was removed!
     truncate_long_lines = False
@@ -220,6 +226,81 @@ class Pdb(pdb.Pdb, ConfigurableClass, object):
         self.stdout = self.ensure_file_can_write_unicode(self.stdout)
         self.saved_curframe = None
         self.last_cmd = None
+        
+        if not os.environ.get("_PDB_DISABLE_PTY", ""):
+            self.old_stdin = os.dup(sys.stdin.fileno())
+            self.old_stdout = os.dup(sys.stdout.fileno())
+            self.old_stderr = os.dup(sys.stderr.fileno())
+
+            master, slave = pty.openpty()
+            self.master, self.slave = master, slave
+            sys.stdout.write(f"Process: {os.getpid()}, Thread: {_thread.get_native_id()}, PTY: " + os.ttyname(slave) + "\n")
+            sys.stdout.flush()
+            
+            tty.setraw(master, termios.TCSANOW)
+
+            os.dup2(master, sys.stdin.fileno())
+            os.dup2(master, sys.stdout.fileno())
+            os.dup2(master, sys.stderr.fileno())
+
+            _rl_patch.patch_hook()
+            self.io_pty = True
+    
+    def trace_dispatch(self, frame, event, arg):
+        if r_flag := os.environ.get("_PDB_RECURSIVE_TRACE", ""):
+            os.environ["_PDB_RECURSIVE_TRACE"] = ""
+
+        with self.set_enterframe(frame):
+            if self.quitting:
+                return # None
+            if event == 'line':
+                return self.dispatch_line(frame) if not r_flag else sys.call_tracing(self.dispatch_line, (frame,))
+            if event == 'call':
+                return self.dispatch_call(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_call, (frame, arg))
+            if event == 'return':
+                return self.dispatch_return(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_return, (frame, arg))
+            if event == 'exception':
+                return self.dispatch_exception(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_exception, (frame, arg))
+            if event == 'c_call':
+                return self.trace_dispatch
+            if event == 'c_exception':
+                return self.trace_dispatch
+            if event == 'c_return':
+                return self.trace_dispatch
+            print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
+            return self.trace_dispatch
+         
+    def _exchange_stdio(self):
+        if hasattr(self, "old_stdin"):
+            tmp_stdin = os.dup(sys.stdin.fileno())
+            tmp_stdout = os.dup(sys.stdout.fileno())
+            tmp_stderr = os.dup(sys.stderr.fileno())
+
+            os.dup2(self.old_stdin, sys.stdin.fileno())
+            os.dup2(self.old_stdout, sys.stdout.fileno())
+            os.dup2(self.old_stderr, sys.stderr.fileno())
+            
+            self.old_stdin = tmp_stdin
+            self.old_stdout = tmp_stdout
+            self.old_stderr = tmp_stderr
+
+            self.io_pty = not self.io_pty
+            if self.io_pty:
+                _rl_patch.patch_hook()
+            else:
+                _rl_patch.unpatch_hook()
+    
+    def __del__(self):
+        if hasattr(self, "old_stdin"):
+            if self.io_pty:
+                self._exchange_stdio()
+            _rl_patch.unpatch_hook()
+            
+            try:
+                os.close(self.master)
+                os.close(self.slave)
+            except OSError:
+                pass
 
     def _runmodule(self, module_name):
         import __main__
@@ -1429,6 +1510,8 @@ GLOBAL_PDB = None
 
 def set_trace(frame=None, header=None, Pdb=Pdb, **kwds):
     global GLOBAL_PDB
+    if GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin") and not GLOBAL_PDB.io_pty:
+        GLOBAL_PDB._exchange_stdio()
     if GLOBAL_PDB and hasattr(GLOBAL_PDB, "_pdbp_completing"):
         return
     if frame is None:
@@ -1449,6 +1532,13 @@ def set_trace(frame=None, header=None, Pdb=Pdb, **kwds):
 def cleanup():
     global GLOBAL_PDB
     GLOBAL_PDB = None
+
+
+def set_none(restore_stdio=True):
+    sys.settrace(None)
+    global GLOBAL_PDB
+    if restore_stdio and GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin") and GLOBAL_PDB.io_pty:
+        GLOBAL_PDB._exchange_stdio()
 
 
 def xpm(Pdb=Pdb):
@@ -1547,6 +1637,7 @@ pdb.signature = signature
 pdb.Undefined = Undefined
 pdb.cleanup = cleanup
 pdb.xpm = xpm
+pdb.set_none = set_none
 
 
 def print_pdb_continue_line():

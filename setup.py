@@ -2,7 +2,7 @@
 An advanced console debugger for Python.
 Can be used as a drop-in replacement for pdb and pdbpp.
 (Python 3.8+)"""
-from setuptools import setup, find_packages  # noqa
+from setuptools import setup, find_packages, Extension  # noqa
 import os
 import sys
 
@@ -85,6 +85,14 @@ setup(
         "Source": "https://github.com/mdmintz/pdbp",
     },
     py_modules=["pdbp"],
+    ext_modules=[
+        Extension(
+            "csrc._rl_patch", 
+            sources=["src/csrc/rl_patch.c"],
+            libraries=["readline"],
+            define_macros=[('DEBUG', None)] if os.environ.get("DEBUG", "") else [],
+        )
+    ],
     package_dir={"": "src"},
     platforms=["Windows", "Linux", "Mac OS-X"],
     author="Michael Mintz",
