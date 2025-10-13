@@ -16,15 +16,18 @@ import traceback
 import types
 from collections import OrderedDict
 from inspect import signature
+import io
 from io import StringIO
 from tabcompleter import Completer, ConfigurableClass, Color
 import tabcompleter
 import _thread
+import threading
 import termios
 import pty
 import tty
 import readline  # To ensure the Python readline hook go first
 import csrc._rl_patch as _rl_patch
+import atexit
 
 __url__ = "https://github.com/mdmintz/pdbp"
 __version__ = tabcompleter.LazyVersion("pdbp")
@@ -32,6 +35,7 @@ run_from_main = False
 
 # Digits, Letters, [], or Dots
 side_effects_free = re.compile(r"^ *[_0-9a-zA-Z\[\].]* *$")
+_pdb_lock = threading.Lock()
 
 
 def import_from_stdlib(name):
@@ -197,7 +201,105 @@ class Undefined:
 undefined = Undefined()
 
 
-class Pdb(pdb.Pdb, ConfigurableClass, object):
+def _new_thread_run(self):
+    rt = _ori_thread_run(self)
+    
+    global GLOBAL_PDB
+    if GLOBAL_PDB is not None:
+        GLOBAL_PDB._cleanup()
+
+    return rt
+
+
+_thread_list = []
+_ori_thread_run = threading.Thread.run
+threading.Thread.run = _new_thread_run 
+_atexit_registered = 0
+        
+
+class _TLocalTextIOWrapper(threading.local):
+    _ori_stream: io.TextIOWrapper
+    _new_stream: io.TextIOWrapper
+    _cur_stream: io.TextIOWrapper
+
+    def __init__(self, _ori):
+        self._cur_stream = self._ori_stream = _ori
+    
+    def __getattr__(self, _name):
+        return getattr(self._cur_stream, _name)
+    
+    def _set_new(self, _new):
+        self._cur_stream = self._new_stream = _new
+
+    def _to_ori(self):
+        self._cur_stream = self._ori_stream
+
+    def _to_new(self):
+        self._cur_stream = self._new_stream
+
+
+_restored_tlocal_stdin: _TLocalTextIOWrapper = None
+_restored_tlocal_stdout: _TLocalTextIOWrapper = None
+_restored_tlocal_stderr: _TLocalTextIOWrapper = None
+
+
+def _set_tlocal(_stream):
+    if isinstance((_s_sys := getattr(sys, _stream)), _TLocalTextIOWrapper):
+        return 
+    
+    _rs_name = f"_restored_tlocal_{_stream}"
+    if isinstance((_rs_tlocal := globals()[_rs_name]), _TLocalTextIOWrapper):
+        setattr(sys, _stream, _rs_tlocal)
+        return
+
+    _s_tlocal = _TLocalTextIOWrapper(_s_sys)
+    setattr(sys, _stream, _s_tlocal)
+    globals()[_rs_name] = _s_tlocal
+
+
+def _stdio_set_tlocal():
+    _set_tlocal("stdin")
+    _set_tlocal("stdout")
+    _set_tlocal("stderr")
+
+
+def _stdio_unset_tlocal():
+    if isinstance(sys.stdin, _TLocalTextIOWrapper):
+        sys.stdin = sys.stdin._ori_stream
+    if isinstance(sys.stdout, _TLocalTextIOWrapper):
+        sys.stdout = sys.stdout._ori_stream
+    if isinstance(sys.stderr, _TLocalTextIOWrapper):
+        sys.stderr = sys.stderr._ori_stream
+
+
+def _stdio_set_new(_is, _os, _es):
+    if isinstance(sys.stdin, _TLocalTextIOWrapper):
+        sys.stdin._set_new(_is)
+    if isinstance(sys.stdout, _TLocalTextIOWrapper):
+        sys.stdout._set_new(_os)
+    if isinstance(sys.stderr, _TLocalTextIOWrapper):
+        sys.stderr._set_new(_es)
+
+
+def _stdio_to_ori():
+    if isinstance(sys.stdin, _TLocalTextIOWrapper):
+        sys.stdin._to_ori()
+    if isinstance(sys.stdout, _TLocalTextIOWrapper):
+        sys.stdout._to_ori()
+    if isinstance(sys.stderr, _TLocalTextIOWrapper):
+        sys.stderr._to_ori()
+
+
+def _stdio_to_new():
+    if isinstance(sys.stdin, _TLocalTextIOWrapper):
+        sys.stdin._to_new()
+    if isinstance(sys.stdout, _TLocalTextIOWrapper):
+        sys.stdout._to_new()
+    if isinstance(sys.stderr, _TLocalTextIOWrapper):
+        sys.stderr._to_new()
+
+
+class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     DefaultConfig = DefaultConfig
     config_filename = ".pdbrc.py"
 
@@ -210,7 +312,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, object):
         if self.config.disable_pytest_capturing:
             self._disable_pytest_capture_maybe()
         kwargs = self.config.default_pdb_kwargs.copy()
-        kwargs.update(**kwds)
+        kwargs.update({**kwds, "skip": ["pdbp"]})
         super().__init__(*args, **kwargs)
         self.prompt = self.config.prompt
         self.display_list = {}  # frame --> (name --> last seen value)
@@ -223,29 +325,49 @@ class Pdb(pdb.Pdb, ConfigurableClass, object):
         self.history = []
         self.show_hidden_frames = False
         self._hidden_frames = []
-        self.stdout = self.ensure_file_can_write_unicode(self.stdout)
         self.saved_curframe = None
         self.last_cmd = None
         
+        global _atexit_registered
+        if not _atexit_registered and os.getpid() == _thread.get_native_id():
+            atexit.register(self._cleanup)
+            _atexit_registered = 1
+
         if not os.environ.get("_PDB_DISABLE_PTY", ""):
-            self.old_stdin = os.dup(sys.stdin.fileno())
-            self.old_stdout = os.dup(sys.stdout.fileno())
-            self.old_stderr = os.dup(sys.stderr.fileno())
-
+            _stdio_set_tlocal()
             master, slave = pty.openpty()
-            self.master, self.slave = master, slave
-            sys.stdout.write(f"Process: {os.getpid()}, Thread: {_thread.get_native_id()}, PTY: " + os.ttyname(slave) + "\n")
-            sys.stdout.flush()
-            
             tty.setraw(master, termios.TCSANOW)
+            self.master, self.slave = master, slave
 
-            os.dup2(master, sys.stdin.fileno())
-            os.dup2(master, sys.stdout.fileno())
-            os.dup2(master, sys.stderr.fileno())
+            self.old_stdin = sys.stdin._ori_stream
+            self.old_stdout = sys.stdout._ori_stream
+            self.old_stderr = sys.stderr._ori_stream
 
-            _rl_patch.patch_hook()
+            self.old_stdout.write(f"Process: {os.getpid()}, Thread: {_thread.get_native_id()}, PTY: " + os.ttyname(slave) + "\n")
+            self.old_stdout.flush()
+
+            self.stdin = open(master, "r")
+            self.stdout = open(os.dup(master), "w")
+            self.stderr = self.stdout
+            _stdio_set_new(self.stdin, self.stdout, self.stderr)
+
+            _rl_patch.patch_hook(self.master)
             self.io_pty = True
+        
+        self.stdout = self.ensure_file_can_write_unicode(self.stdout)
+        
+        global _thread_list
+        cur_id = _thread.get_native_id()
+        assert cur_id not in _thread_list
+        _thread_list.append(cur_id)
+        if hasattr(self, "old_stdin"):
+            self.stdin.fileno = (lambda self: 0).__get__(self.stdin)
+            self.stdout.fileno = (lambda self: 1).__get__(self.stdout)
     
+    def postloop(self):
+        super().postloop()
+        _pdb_lock.release()
+
     def trace_dispatch(self, frame, event, arg):
         if r_flag := os.environ.get("_PDB_RECURSIVE_TRACE", ""):
             os.environ["_PDB_RECURSIVE_TRACE"] = ""
@@ -269,39 +391,54 @@ class Pdb(pdb.Pdb, ConfigurableClass, object):
                 return self.trace_dispatch
             print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
             return self.trace_dispatch
-         
+    
+    def _attach(self):
+        assert hasattr(self, "io_pty")
+        _stdio_set_tlocal()
+        if not self.io_pty:
+            self._exchange_stdio()
+
+    def _detach(self):
+        assert hasattr(self, "io_pty")
+        if self.io_pty:
+            self._exchange_stdio()
+
     def _exchange_stdio(self):
         if hasattr(self, "old_stdin"):
-            tmp_stdin = os.dup(sys.stdin.fileno())
-            tmp_stdout = os.dup(sys.stdout.fileno())
-            tmp_stderr = os.dup(sys.stderr.fileno())
-
-            os.dup2(self.old_stdin, sys.stdin.fileno())
-            os.dup2(self.old_stdout, sys.stdout.fileno())
-            os.dup2(self.old_stderr, sys.stderr.fileno())
-            
-            self.old_stdin = tmp_stdin
-            self.old_stdout = tmp_stdout
-            self.old_stderr = tmp_stderr
-
+            self.stdin, self.old_stdin = self.old_stdin, self.stdin
+            self.stdout, self.old_stdout = self.old_stdout, self.stdout
+            self.stderr, self.old_stderr = self.old_stderr, self.stderr
+           
             self.io_pty = not self.io_pty
             if self.io_pty:
-                _rl_patch.patch_hook()
+                _stdio_to_new()
+                _rl_patch.patch_hook(self.master)
             else:
-                _rl_patch.unpatch_hook()
+                _stdio_to_ori()
+                _rl_patch.close_f_pty()
     
-    def __del__(self):
+    def _cleanup(self):
+        _pdb_lock.acquire()
+        global _thread_list
+        cur_id = _thread.get_native_id()
+        if cur_id in _thread_list:
+            _thread_list.remove(cur_id)
+
         if hasattr(self, "old_stdin"):
-            if self.io_pty:
-                self._exchange_stdio()
-            _rl_patch.unpatch_hook()
-            
+            if _thread_list:
+                _rl_patch.close_f_pty()
+            else:
+                _stdio_unset_tlocal()
+                _rl_patch.unpatch_hook()
+
             try:
-                os.close(self.master)
+                self.stdin.close() if self.io_pty else self.old_stdin.close()
+                self.stdout.close() if self.io_pty else self.old_stdout.close()
                 os.close(self.slave)
             except OSError:
                 pass
-
+        _pdb_lock.release()
+    
     def _runmodule(self, module_name):
         import __main__
         import runpy
@@ -1292,6 +1429,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, object):
             print(file=self.stdout, end="\n\033[F")
 
     def preloop(self):
+        _pdb_lock.acquire()
         self._print_if_sticky()
         display_list = self._get_display_list()
         for expr, oldvalue in display_list.items():
@@ -1509,9 +1647,10 @@ GLOBAL_PDB = None
 
 
 def set_trace(frame=None, header=None, Pdb=Pdb, **kwds):
+    _pdb_lock.acquire()
     global GLOBAL_PDB
-    if GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin") and not GLOBAL_PDB.io_pty:
-        GLOBAL_PDB._exchange_stdio()
+    if GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin"):
+        GLOBAL_PDB._attach()
     if GLOBAL_PDB and hasattr(GLOBAL_PDB, "_pdbp_completing"):
         return
     if frame is None:
@@ -1527,6 +1666,7 @@ def set_trace(frame=None, header=None, Pdb=Pdb, **kwds):
     if header is not None:
         pdb.message(header)
     pdb.set_trace(frame)
+    _pdb_lock.release()
 
 
 def cleanup():
@@ -1535,10 +1675,12 @@ def cleanup():
 
 
 def set_none(restore_stdio=True):
+    _pdb_lock.acquire()
     sys.settrace(None)
     global GLOBAL_PDB
-    if restore_stdio and GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin") and GLOBAL_PDB.io_pty:
-        GLOBAL_PDB._exchange_stdio()
+    if restore_stdio and GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin"):
+        GLOBAL_PDB._detach()
+    _pdb_lock.release()
 
 
 def xpm(Pdb=Pdb):
@@ -1683,7 +1825,9 @@ def main():
     if not run_as_module:
         mainpyfile = os.path.realpath(mainpyfile)
         sys.path[0] = os.path.dirname(mainpyfile)
+    _pdb_lock.acquire()
     pdb = Pdb()
+    _pdb_lock.release()
     pdb.rcLines.extend(commands)
     stay_in_pdb = True
     while stay_in_pdb:
