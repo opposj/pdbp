@@ -28,6 +28,7 @@ import tty
 import readline  # To ensure the Python readline hook go first
 import csrc._rl_patch as _rl_patch
 import atexit
+import time
 
 __url__ = "https://github.com/mdmintz/pdbp"
 __version__ = tabcompleter.LazyVersion("pdbp")
@@ -366,7 +367,6 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     
     def postloop(self):
         super().postloop()
-        _pdb_lock.release()
 
     def trace_dispatch(self, frame, event, arg):
         if r_flag := os.environ.get("_PDB_RECURSIVE_TRACE", ""):
@@ -430,6 +430,9 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             else:
                 _stdio_unset_tlocal()
                 _rl_patch.unpatch_hook()
+
+            self.stdout.flush() if self.io_pty else self.old_stdout.flush()
+            time.sleep(0.1) # Ensure all output is transmitted 
 
             try:
                 self.stdin.close() if self.io_pty else self.old_stdin.close()
@@ -1429,7 +1432,6 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             print(file=self.stdout, end="\n\033[F")
 
     def preloop(self):
-        _pdb_lock.acquire()
         self._print_if_sticky()
         display_list = self._get_display_list()
         for expr, oldvalue in display_list.items():
