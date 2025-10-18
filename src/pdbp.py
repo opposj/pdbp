@@ -26,7 +26,10 @@ import termios
 import pty
 import tty
 import readline  # To ensure the Python readline hook go first
-import csrc._rl_patch as _rl_patch
+if not os.environ.get("_PDB_W_MT", ""):
+    import csrc._rl_patch as _rl_patch
+else:
+    import csrc._rl_patch_mt as _rl_patch
 import atexit
 import time
 
@@ -37,6 +40,7 @@ run_from_main = False
 # Digits, Letters, [], or Dots
 side_effects_free = re.compile(r"^ *[_0-9a-zA-Z\[\].]* *$")
 _pdb_lock = threading.Lock()
+_readline_lock = threading.Lock()
 
 
 def import_from_stdlib(name):
@@ -208,6 +212,11 @@ def _new_thread_run(self):
     global GLOBAL_PDB
     if GLOBAL_PDB is not None:
         GLOBAL_PDB._cleanup()
+    
+    try:
+        _readline_lock.release()
+    except RuntimeError:
+        pass
 
     return rt
 
@@ -362,11 +371,67 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         assert cur_id not in _thread_list
         _thread_list.append(cur_id)
         if hasattr(self, "old_stdin"):
-            self.stdin.fileno = (lambda self: 0).__get__(self.stdin)
-            self.stdout.fileno = (lambda self: 1).__get__(self.stdout)
+            if not os.environ.get("_PDB_W_MT", ""):
+                self.stdin.fileno = (lambda self: 0).__get__(self.stdin)
+                self.stdout.fileno = (lambda self: 1).__get__(self.stdout)
+                self.cmdqueue.append("_acquire")
+            else:
+                self.stdin.readline = _rl_patch.pty_readline
     
-    def postloop(self):
-        super().postloop()
+    if not os.environ.get("_PDB_W_MT", ""):
+        def do__acquire(self, arg):
+            _readline_lock.acquire()
+        
+        def do_release(self, arg):
+            try:
+                _readline_lock.release()
+            except RuntimeError:
+                pass
+            self.cmdqueue.append("_acquire")
+            return 1
+
+        do_release.__doc__ = ( 
+        """ release
+
+        Release the readline lock, enable other threads to take control of debugging.
+        """
+    )
+    
+        def do_rcontinue(self, arg):
+            self.do_release(arg)
+            return self.do_continue(arg)
+        
+        do_rcontinue.__doc__ = ( 
+        """ rc(ont(inue))
+
+        Equivalent to executing `release` and `continue` sequentially.
+        """
+    )
+        do_rc = do_rcont = do_rcontinue
+
+        def do_rnext(self, arg):
+            self.do_release(arg)
+            return self.do_next(arg)
+        
+        do_rnext.__doc__ = ( 
+        """ rn(ext)
+
+        Equivalent to executing `release` and `next` sequentially.
+        """
+    )
+        do_rn = do_rnext
+
+        def do_rstep(self, arg):
+            self.do_release(arg)
+            return self.do_step(arg)
+        
+        do_rstep.__doc__ = ( 
+        """ rs(tep)
+
+        Equivalent to executing `release` and `step` sequentially.
+        """
+    )
+        do_rs = do_rstep
 
     def trace_dispatch(self, frame, event, arg):
         if r_flag := os.environ.get("_PDB_RECURSIVE_TRACE", ""):
@@ -677,11 +742,15 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         if hasattr(self, "_fmt"):
             return True
         try:
+            _pdb_lock.acquire()
+            # Race condition when importing
             from pygments.lexers import PythonLexer
             from pygments.formatters import TerminalFormatter
             from pygments.formatters import Terminal256Formatter
+            _pdb_lock.release()
         except ImportError:
-            return False
+            # return False
+            raise
         if hasattr(self.config, "formatter"):
             self._fmt = self.config.formatter
         else:
