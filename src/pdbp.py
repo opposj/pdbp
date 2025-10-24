@@ -33,6 +33,52 @@ else:
 import atexit
 import time
 
+
+try:
+    from pygments.styles.zenburn import ZenburnStyle 
+    from pygments.token import Keyword, Name, Comment, String, Error, Number, Operator, Generic, Token, Literal, Punctuation
+
+    class DesertStyle(ZenburnStyle):
+        styles = {
+            **ZenburnStyle.styles,
+            Token: '#ffffff',
+
+            Keyword: '#d7d787',
+            Keyword.Type: '#87ff87',
+            Keyword.Constant: '#87ff87',
+            Keyword.Declaration: '#d7d787',
+            Keyword.Namespace: '#d75f5f',
+            Keyword.Reserved: '#d7d787',
+
+            Name: '#ffffff',
+            Name.Class: '#afaf5f',
+            Name.Function: '#87ff87',
+            Name.Builtin: '#87ff87',
+            Name.Builtin.Pseudo: '#87ff87',
+            Name.Exception: '#afaf5f',
+            Name.Decorator: '#87ff87',
+
+            Literal: '#ffafaf',
+
+            String: '#ffafaf',
+            String.Doc: '#ffafaf',
+            String.Interpol: '#ffffff',
+
+            Number: '#ffafaf',
+            Number.Float: '#ffafaf',
+
+            Operator: '#ffffff',
+
+            Punctuation: '#ffffff',
+
+            Comment: '#5fd7ff',
+            Comment.Multiline: '#ffafaf',
+        }
+
+except ImportError:
+    DesertStyle = "zenburn"
+
+
 __url__ = "https://github.com/mdmintz/pdbp"
 __version__ = tabcompleter.LazyVersion("pdbp")
 run_from_main = False
@@ -53,8 +99,17 @@ def import_from_stdlib(name):
     exec(co_module, result.__dict__)
     return result
 
+def import_from_custom(name):
+    result = types.ModuleType(name)
+    pyfile = os.path.join(os.path.dirname(__file__), "cpython", "Lib", name + ".py")
+    with open(pyfile) as f:
+        src = f.read()
+    co_module = compile(src, pyfile, "exec", dont_inherit=True)
+    exec(co_module, result.__dict__)
+    return result
 
 pdb = import_from_stdlib("pdb")
+# pdb = import_from_custom("pdb")
 
 
 def rebind_globals(func, newglobals):
@@ -129,6 +184,7 @@ class DefaultConfig(object):
     bg = "dark"
     use_pygments = True
     colorscheme = None
+    style = DesertStyle
     use_terminal256formatter = None  # Defaults to `"256color" in $TERM`.
     editor = "${EDITOR:-vim}"  # Use $EDITOR if set; else default to vi.
     stdin_paste = None
@@ -209,6 +265,9 @@ undefined = Undefined()
 def _new_thread_run(self):
     rt = _ori_thread_run(self)
     
+    if _thread.get_native_id() not in _thread_list:
+        return rt
+
     global GLOBAL_PDB
     if GLOBAL_PDB is not None:
         GLOBAL_PDB._cleanup()
@@ -365,7 +424,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             self.io_pty = True
         
         self.stdout = self.ensure_file_can_write_unicode(self.stdout)
-        
+
         global _thread_list
         cur_id = _thread.get_native_id()
         assert cur_id not in _thread_list
@@ -432,30 +491,32 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         """
     )
         do_rs = do_rstep
+    
+    if os.environ.get("_ENABLE_PDB_RECURSIVE_TRACE", ""):
 
-    def trace_dispatch(self, frame, event, arg):
-        if r_flag := os.environ.get("_PDB_RECURSIVE_TRACE", ""):
-            os.environ["_PDB_RECURSIVE_TRACE"] = ""
+        def trace_dispatch(self, frame, event, arg):
+            if r_flag := os.environ.get("_PDB_RECURSIVE_TRACE", ""):
+                os.environ["_PDB_RECURSIVE_TRACE"] = ""
 
-        with self.set_enterframe(frame):
-            if self.quitting:
-                return # None
-            if event == 'line':
-                return self.dispatch_line(frame) if not r_flag else sys.call_tracing(self.dispatch_line, (frame,))
-            if event == 'call':
-                return self.dispatch_call(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_call, (frame, arg))
-            if event == 'return':
-                return self.dispatch_return(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_return, (frame, arg))
-            if event == 'exception':
-                return self.dispatch_exception(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_exception, (frame, arg))
-            if event == 'c_call':
+            with self.set_enterframe(frame):
+                if self.quitting:
+                    return # None
+                if event == 'line':
+                    return self.dispatch_line(frame) if not r_flag else sys.call_tracing(self.dispatch_line, (frame,))
+                if event == 'call':
+                    return self.dispatch_call(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_call, (frame, arg))
+                if event == 'return':
+                    return self.dispatch_return(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_return, (frame, arg))
+                if event == 'exception':
+                    return self.dispatch_exception(frame, arg) if not r_flag else sys.call_tracing(self.dispatch_exception, (frame, arg))
+                if event == 'c_call':
+                    return self.trace_dispatch
+                if event == 'c_exception':
+                    return self.trace_dispatch
+                if event == 'c_return':
+                    return self.trace_dispatch
+                print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
                 return self.trace_dispatch
-            if event == 'c_exception':
-                return self.trace_dispatch
-            if event == 'c_return':
-                return self.trace_dispatch
-            print('bdb.Bdb.dispatch: unknown debugging event:', repr(event))
-            return self.trace_dispatch
     
     def _attach(self):
         assert hasattr(self, "io_pty")
@@ -761,7 +822,8 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             else:
                 Formatter = TerminalFormatter
             self._fmt = Formatter(bg=self.config.bg,
-                                  colorscheme=self.config.colorscheme)
+                                  colorscheme=self.config.colorscheme,
+                                  style=self.config.style)
         self._lexer = PythonLexer()
         return True
 

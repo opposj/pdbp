@@ -327,6 +327,8 @@ static PyObject* close_f_pty(void) {
 		fflush(f_pty_out);
 		fclose(f_pty_in);
 		fclose(f_pty_out);
+		f_pty_in = NULL; 
+		f_pty_out = NULL;
 		f_pty_set = 0;
 		LOG_DEBUG("STDIO files unset successfully");
 	} else {
