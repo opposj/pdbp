@@ -32,6 +32,7 @@ else:
     import csrc._rl_patch_mt as _rl_patch
 import atexit
 import time
+import objprint
 
 
 try:
@@ -217,6 +218,10 @@ class DefaultConfig(object):
     show_traceback_on_error_limit = None
     default_pdb_kwargs = {
     }
+    external_print_tmp_dir = "~/.pdbp_ep_cache"
+    external_print_prefix = "eval"
+    external_print_postfix = ".py"
+    external_print_cache_limit = -1
 
     def setup(self, pdb):
         pass
@@ -396,9 +401,14 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         self._hidden_frames = []
         self.saved_curframe = None
         self.last_cmd = None
-        
+        self._ep_counter = 0
+        self._thread_id = _thread.get_native_id()
+        self._ep_path = os.path.expanduser(os.path.join(self.config.external_print_tmp_dir, str(self._thread_id)))
+        os.makedirs(self._ep_path, exist_ok=True)
+        self._ep_map = {}
+
         global _atexit_registered
-        if not _atexit_registered and os.getpid() == _thread.get_native_id():
+        if not _atexit_registered and os.getpid() == self._thread_id:
             atexit.register(self._cleanup)
             _atexit_registered = 1
 
@@ -412,7 +422,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             self.old_stdout = sys.stdout._ori_stream
             self.old_stderr = sys.stderr._ori_stream
 
-            self.old_stdout.write(f"Process: {os.getpid()}, Thread: {_thread.get_native_id()}, PTY: " + os.ttyname(slave) + "\n")
+            self.old_stdout.write(f"Process: {os.getpid()}, Thread: {self._thread_id}, PTY: " + os.ttyname(slave) + "\n")
             self.old_stdout.flush()
 
             self.stdin = open(master, "r")
@@ -426,9 +436,8 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         self.stdout = self.ensure_file_can_write_unicode(self.stdout)
 
         global _thread_list
-        cur_id = _thread.get_native_id()
-        assert cur_id not in _thread_list
-        _thread_list.append(cur_id)
+        assert self._thread_id not in _thread_list
+        _thread_list.append(self._thread_id)
         if hasattr(self, "old_stdin"):
             if not os.environ.get("_PDB_W_MT", ""):
                 self.stdin.fileno = (lambda self: 0).__get__(self.stdin)
@@ -437,6 +446,45 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             else:
                 self.stdin.readline = _rl_patch.pty_readline
     
+    def do_ext_print(self, arg):
+        try:
+            var = eval(arg, self.curframe.f_globals, self.curframe_locals)
+        except Exception:
+            if not arg:
+                print(
+                    f"Cached external prints of <PID {self._thread_id}>:", 
+                    file=self.stdout,
+                )
+                pprint.pp(self._ep_map, stream=self.stdout)
+                return
+            else:
+                print(
+                    'See "locals()" or "globals()" for available args!',
+                    file=self.stdout,
+                )
+                return
+        tmp_name = self.config.external_print_prefix + str(self._ep_counter) + self.config.external_print_postfix
+        tmp_path = os.path.join(self._ep_path, tmp_name)
+        try:
+            with open(tmp_path, "w") as f:
+                objprint.op(var, file=f)
+            os.system('%s "%s"' % (self.config.editor, tmp_path))
+        except Exception:
+            print("Invalid print!", file=self.stdout)
+            return
+        if self.config.external_print_cache_limit == len(self._ep_map):
+            self._ep_map.pop(next(iter(self._ep_map)))
+        self._ep_map[tmp_name] = codecs.escape_decode(arg)[0].decode("utf-8")
+        self._ep_counter += 1
+    
+    do_ext_print.__doc__ = (
+    """ e[xt_]p[rint] expression
+
+    Print the value of the expression to an external file. If the expression is not given, print all the cached prints of the current thread.
+    """
+)
+    do_ep = do_ext_print
+
     if not os.environ.get("_PDB_W_MT", ""):
         def do__acquire(self, arg):
             _readline_lock.acquire()
@@ -546,9 +594,8 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     def _cleanup(self):
         _pdb_lock.acquire()
         global _thread_list
-        cur_id = _thread.get_native_id()
-        if cur_id in _thread_list:
-            _thread_list.remove(cur_id)
+        if self._thread_id in _thread_list:
+            _thread_list.remove(self._thread_id)
 
         if hasattr(self, "old_stdin"):
             if _thread_list:
@@ -566,6 +613,10 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 os.close(self.slave)
             except OSError:
                 pass
+
+        if os.path.exists(self._ep_path):
+            os.system(f"rm -rf {self._ep_path}")
+
         _pdb_lock.release()
     
     def _runmodule(self, module_name):

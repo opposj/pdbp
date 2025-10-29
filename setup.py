@@ -132,6 +132,7 @@ setup(
         "pygments>=2.19.2",
         "tabcompleter>=1.4.0",
         'colorama>=0.4.6;platform_system=="Windows"',
+        'objprint',
     ],
     setup_requires=[],
     include_package_data=True,

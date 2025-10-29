@@ -267,6 +267,9 @@ exit:
 static thread_local int f_pty_set = 0;
 static thread_local FILE* f_pty_in = NULL; 
 static thread_local FILE* f_pty_out = NULL;
+// Refactor for better stdio tty ensurance and recovery
+static thread_local int old_stdin;
+static thread_local int old_stdout;
 static int patched = 0;
 static rl_hook_func_t* original_hook = NULL;
 static char* (*ori_readline_func)(FILE*, FILE*, const char*) = NULL;
@@ -297,6 +300,10 @@ static PyObject* open_f_pty(PyObject* py_fd) {
 		int fd = (int) PyLong_AsLong(py_fd);
 		f_pty_in = fdopen(dup(fd), "r");
 		f_pty_out = fdopen(dup(fd), "w");
+		old_stdin = dup(0);
+		old_stdout = dup(1);
+		dup2(fd, 0);
+		dup2(fd, 1);
 		f_pty_set = 1;
         LOG_DEBUG("STDIO files set successfully");
     } else {
@@ -329,6 +336,10 @@ static PyObject* close_f_pty(void) {
 		fclose(f_pty_out);
 		f_pty_in = NULL; 
 		f_pty_out = NULL;
+		dup2(old_stdin, 0);
+		dup2(old_stdout, 1);
+		close(old_stdin);
+		close(old_stdout);
 		f_pty_set = 0;
 		LOG_DEBUG("STDIO files unset successfully");
 	} else {
