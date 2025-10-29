@@ -1,4 +1,0 @@
-[submodule "src/cpython"]
-	path = src/cpython
-	url = https://github.com/python/cpython
-	branch = v3.12.12
