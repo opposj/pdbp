@@ -34,7 +34,6 @@ import atexit
 import time
 import objprint
 
-
 try:
     from pygments.styles.zenburn import ZenburnStyle 
     from pygments.token import Keyword, Name, Comment, String, Error, Number, Operator, Generic, Token, Literal, Punctuation
@@ -186,7 +185,7 @@ class DefaultConfig(object):
     use_pygments = True
     colorscheme = None
     style = DesertStyle
-    use_terminal256formatter = None  # Defaults to `"256color" in $TERM`.
+    use_terminal256formatter = True  # Defaults to `"256color" in $TERM`.
     editor = "${EDITOR:-vim}"  # Use $EDITOR if set; else default to vi.
     stdin_paste = None
     exec_if_unfocused = None  # This option was removed!
@@ -197,8 +196,8 @@ class DefaultConfig(object):
     show_hidden_frames_count = False
     encodings = ("utf-8", "latin-1")
     filename_color = Color.fuchsia
-    line_number_color = Color.turquoise
-    regular_stack_color = Color.yellow
+    line_number_color = "38;5;226" 
+    regular_stack_color = Color.turquoise
     pm_stack_color = Color.red
     stack_color = regular_stack_color
     # https://en.wikipedia.org/wiki/ANSI_escape_code#3-bit_and_4-bit
@@ -469,6 +468,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             with open(tmp_path, "w") as f:
                 objprint.op(var, file=f)
             os.system('%s "%s"' % (self.config.editor, tmp_path))
+            print(tmp_name, file=self.stdout)
         except Exception:
             print("Invalid print!", file=self.stdout)
             return
@@ -901,12 +901,20 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 pass
         return s
 
-    def format_source(self, src):
+    def format_source(self, src, *, return_str_code=False):
         if not self._init_pygments():
-            return src
+            if return_str_code:
+                return src, None
+            else:
+                return src
         from pygments import highlight
         src = self.try_to_decode(src)
-        return highlight(src, self._lexer, self._fmt)
+        rt = highlight(src, self._lexer, self._fmt)
+        if return_str_code:
+            str_code = re.match(r".*(38;5;\d+)manystr.*", highlight("'anystr'", self._lexer, self._fmt)).group(1)
+            return rt, str_code
+        else:
+            return rt 
 
     def format_line(self, lineno, marker, line):
         lineno = "%4d" % lineno
@@ -1201,13 +1209,23 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         oldstdout = self.stdout
         self.stdout = StringIO()
         super().do_list(arg)
-        src = self.format_source(self.stdout.getvalue())
+        src, str_code = self.format_source(self.stdout.getvalue(), return_str_code=True)
+        if str_code is not None and str_code != self.config.line_number_color:
+            def _re_lineno_helper(ma):
+                gp1 = ma.group(1) or ma.group(3)
+                gp2 = ma.group(2) or ma.group(4)
+                gp3 = ma.group(5)
+                if not gp3:
+                    return f"{gp1}{self.config.line_number_color}{gp2}"
+                else:
+                    return f"{gp1}{self.config.line_number_color}{gp2}\x1b[39m\x1b[{str_code}m{gp3}"
+            src = re.sub(rf"(\x1b\[38;5;15m[ ]+\x1b\[39m\x1b\[)?{str_code}(m\d+\x1b\[39m.*\n)|(\x1b\[){str_code}(m[ ]*\d+)(.*\x1b\[39m\n)", _re_lineno_helper, src)
         self.stdout = oldstdout
         print(src, file=self.stdout, end="\n\033[F")
 
     do_list.__doc__ = pdb.Pdb.do_list.__doc__
     do_l = do_list
-
+    
     def do_continue(self, arg):
         self.last_cmd = self.lastcmd = "continue"
         if arg != "":
