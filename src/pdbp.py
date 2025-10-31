@@ -22,6 +22,7 @@ from tabcompleter import Completer, ConfigurableClass, Color
 import tabcompleter
 import _thread
 import threading
+import subprocess
 import termios
 import pty
 import tty
@@ -87,6 +88,7 @@ run_from_main = False
 side_effects_free = re.compile(r"^ *[_0-9a-zA-Z\[\].]* *$")
 _pdb_lock = threading.Lock()
 _readline_lock = threading.Lock()
+_inject_lock = threading.Lock()
 
 
 def import_from_stdlib(name):
@@ -99,17 +101,7 @@ def import_from_stdlib(name):
     exec(co_module, result.__dict__)
     return result
 
-def import_from_custom(name):
-    result = types.ModuleType(name)
-    pyfile = os.path.join(os.path.dirname(__file__), "cpython", "Lib", name + ".py")
-    with open(pyfile) as f:
-        src = f.read()
-    co_module = compile(src, pyfile, "exec", dont_inherit=True)
-    exec(co_module, result.__dict__)
-    return result
-
 pdb = import_from_stdlib("pdb")
-# pdb = import_from_custom("pdb")
 
 
 def rebind_globals(func, newglobals):
@@ -266,6 +258,75 @@ class Undefined:
 undefined = Undefined()
 
 
+_inject = {}
+exec(
+    compile(
+        """
+def _inject_wrapper(fn):
+    from functools import wraps
+    @wraps(fn)
+    def new_fn(*args, **kwargs):
+        import pdbp; pdbp.set_trace()
+        return fn(*args, **kwargs)
+    return new_fn
+        """,
+        "<_dynamic_>",
+        "exec",
+    ),
+    _inject,
+)
+_inject = _inject["_inject_wrapper"]
+_inject_handles = {}
+_inject_id =  0
+
+
+class _InjectHandle:
+    def __init__(self, context, clb: str, _id: int):
+        if not hasattr(context, clb):
+            print(f"Attribute {clb} not found in {context}, nothing happens")
+            return
+        clb_ins = getattr(context, clb)
+        self.context = context
+        self.clb_name = clb
+        self.old_clb = clb_ins
+        self.id = _id
+        setattr(self.context, clb, _inject(clb_ins))
+        _inject_handles[self.id] = self
+        print(f"<No.{_id}> Register debug hook for {clb} in {context}")
+
+    def remove(self):
+        setattr(self.context, self.clb_name, self.old_clb)
+        _inject_handles.pop(self.id)
+        print(f"<No.{self.id}> Detach debug hook for {self.clb_name} in {self.context}")
+
+    def __repr__(self):
+        context_name = getattr(self.context, "__name__", "<no name>")
+        return f"{context_name}.{self.clb_name}"
+
+
+def inject_debug(context, clb):
+    _inject_lock.acquire()
+    global _inject_id
+    hook = _InjectHandle(context, clb, _inject_id)
+    _inject_id += 1
+    _inject_lock.release()
+
+
+def remove_debug(id_num):
+    _inject_lock.acquire()
+    if id_num not in _inject_handles:
+        print(f"The hook <No.{id_num}> does not exist, use `pdbp.show_debug()` to get available numbers")
+        return
+    _inject_handles[id_num].remove()
+    _inject_lock.release()
+
+
+def show_debug():
+    _inject_lock.acquire()
+    pprint.pp(_inject_handles)
+    _inject_lock.release()
+
+
 def _new_thread_run(self):
     rt = _ori_thread_run(self)
     
@@ -275,9 +336,19 @@ def _new_thread_run(self):
     global GLOBAL_PDB
     if GLOBAL_PDB is not None:
         GLOBAL_PDB._cleanup()
-    
+   
+    try:
+        _pdb_lock.release()
+    except RuntimeError:
+        pass
+
     try:
         _readline_lock.release()
+    except RuntimeError:
+        pass
+    
+    try:
+        _inject_lock.release()
     except RuntimeError:
         pass
 
@@ -295,7 +366,8 @@ class _TLocalTextIOWrapper(threading.local):
     _new_stream: io.TextIOWrapper
     _cur_stream: io.TextIOWrapper
 
-    def __init__(self, _ori):
+    def __init__(self, _ori_ori, _ori):
+        self._ori_ori_stream = _ori_ori
         self._cur_stream = self._ori_stream = _ori
     
     def __getattr__(self, _name):
@@ -309,6 +381,9 @@ class _TLocalTextIOWrapper(threading.local):
 
     def _to_new(self):
         self._cur_stream = self._new_stream
+    
+    def _clean(self):
+        self._ori_stream.close()
 
 
 _restored_tlocal_stdin: _TLocalTextIOWrapper = None
@@ -316,7 +391,7 @@ _restored_tlocal_stdout: _TLocalTextIOWrapper = None
 _restored_tlocal_stderr: _TLocalTextIOWrapper = None
 
 
-def _set_tlocal(_stream):
+def _set_tlocal(_stream, _mode):
     if isinstance((_s_sys := getattr(sys, _stream)), _TLocalTextIOWrapper):
         return 
     
@@ -325,24 +400,24 @@ def _set_tlocal(_stream):
         setattr(sys, _stream, _rs_tlocal)
         return
 
-    _s_tlocal = _TLocalTextIOWrapper(_s_sys)
+    _s_tlocal = _TLocalTextIOWrapper(_s_sys, io.TextIOWrapper(io.FileIO(os.dup(_s_sys.fileno()), mode=_mode, closefd=True), encoding='utf-8'))
     setattr(sys, _stream, _s_tlocal)
     globals()[_rs_name] = _s_tlocal
 
 
 def _stdio_set_tlocal():
-    _set_tlocal("stdin")
-    _set_tlocal("stdout")
-    _set_tlocal("stderr")
+    _set_tlocal("stdin", "r")
+    _set_tlocal("stdout", "w")
+    _set_tlocal("stderr", "w")
 
 
 def _stdio_unset_tlocal():
     if isinstance(sys.stdin, _TLocalTextIOWrapper):
-        sys.stdin = sys.stdin._ori_stream
+        sys.stdin = sys.stdin._ori_ori_stream
     if isinstance(sys.stdout, _TLocalTextIOWrapper):
-        sys.stdout = sys.stdout._ori_stream
+        sys.stdout = sys.stdout._ori_ori_stream
     if isinstance(sys.stderr, _TLocalTextIOWrapper):
-        sys.stderr = sys.stderr._ori_stream
+        sys.stderr = sys.stderr._ori_ori_stream
 
 
 def _stdio_set_new(_is, _os, _es):
@@ -372,6 +447,15 @@ def _stdio_to_new():
         sys.stderr._to_new()
 
 
+def _stdio_clean():
+    if isinstance(sys.stdin, _TLocalTextIOWrapper):
+        sys.stdin._clean()
+    if isinstance(sys.stdout, _TLocalTextIOWrapper):
+        sys.stdout._clean()
+    if isinstance(sys.stderr, _TLocalTextIOWrapper):
+        sys.stderr._clean()
+
+
 class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     DefaultConfig = DefaultConfig
     config_filename = ".pdbrc.py"
@@ -387,6 +471,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         kwargs = self.config.default_pdb_kwargs.copy()
         kwargs.update({**kwds, "skip": ["pdbp"]})
         super().__init__(*args, **kwargs)
+        self.stderr = self.stdout
         self.prompt = self.config.prompt
         self.display_list = {}  # frame --> (name --> last seen value)
         self.sticky = self.config.sticky_by_default
@@ -403,7 +488,6 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         self._ep_counter = 0
         self._thread_id = _thread.get_native_id()
         self._ep_path = os.path.expanduser(os.path.join(self.config.external_print_tmp_dir, str(self._thread_id)))
-        os.makedirs(self._ep_path, exist_ok=True)
         self._ep_map = {}
 
         global _atexit_registered
@@ -444,7 +528,15 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 self.cmdqueue.append("_acquire")
             else:
                 self.stdin.readline = _rl_patch.pty_readline
-    
+
+    def do_EOF(self, arg):
+        try:
+            _readline_lock.release()
+        except RuntimeError:
+            pass
+        return super().do_EOF(arg)
+    do_EOF.__doc__ = pdb.Pdb.do_EOF.__doc__
+
     def do_ext_print(self, arg):
         try:
             var = eval(arg, self.curframe.f_globals, self.curframe_locals)
@@ -465,10 +557,13 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         tmp_name = self.config.external_print_prefix + str(self._ep_counter) + self.config.external_print_postfix
         tmp_path = os.path.join(self._ep_path, tmp_name)
         try:
+            if not os.path.exists(self._ep_path):
+                os.makedirs(self._ep_path)
             with open(tmp_path, "w") as f:
                 objprint.op(var, file=f)
-            os.system('%s "%s"' % (self.config.editor, tmp_path))
-            print(tmp_name, file=self.stdout)
+            # subprocess.call(f"{self.config.editor} -c 'term ++curwin bash -c \"cat {tmp_path} | less -R\"'", shell=True, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr)
+            subprocess.call(f"{self.config.editor} -c 'echo &columns .. \" \" .. &lines'", shell=True, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr)
+            print(os.path.join(str(self._thread_id), tmp_name), file=self.stdout)
         except Exception:
             print("Invalid print!", file=self.stdout)
             return
@@ -495,7 +590,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             except RuntimeError:
                 pass
             self.cmdqueue.append("_acquire")
-            return 1
+            return 
 
         do_release.__doc__ = ( 
         """ release
@@ -592,6 +687,15 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 _rl_patch.close_f_pty()
     
     def _cleanup(self):
+        if os.path.exists(self._ep_path):
+            os.system(f"rm -rf {self._ep_path}")
+        
+        # If Pdbp corrupt during initialization
+        try:
+            _pdb_lock.release()
+        except RuntimeError:
+            pass
+
         _pdb_lock.acquire()
         global _thread_list
         if self._thread_id in _thread_list:
@@ -601,6 +705,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             if _thread_list:
                 _rl_patch.close_f_pty()
             else:
+                _stdio_clean()
                 _stdio_unset_tlocal()
                 _rl_patch.unpatch_hook()
 
@@ -613,9 +718,6 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 os.close(self.slave)
             except OSError:
                 pass
-
-        if os.path.exists(self._ep_path):
-            os.system(f"rm -rf {self._ep_path}")
 
         _pdb_lock.release()
     
@@ -1743,7 +1845,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
 
     def _open_editor(self, editor, lineno, filename):
         filename = filename.replace('"', '\\"')
-        os.system('%s "%s"' % (editor, filename))
+        subprocess.call('%s "%s"' % (editor, filename), shell=True, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr)
 
     def _get_current_position(self):
         frame = self.curframe
@@ -1851,10 +1953,11 @@ GLOBAL_PDB = None
 def set_trace(frame=None, header=None, Pdb=Pdb, **kwds):
     _pdb_lock.acquire()
     global GLOBAL_PDB
+    if GLOBAL_PDB and hasattr(GLOBAL_PDB, "_pdbp_completing"):
+        _pdb_lock.release()
+        return
     if GLOBAL_PDB and hasattr(GLOBAL_PDB, "old_stdin"):
         GLOBAL_PDB._attach()
-    if GLOBAL_PDB and hasattr(GLOBAL_PDB, "_pdbp_completing"):
-        return
     if frame is None:
         frame = sys._getframe().f_back
     if GLOBAL_PDB:
@@ -1982,6 +2085,9 @@ pdb.Undefined = Undefined
 pdb.cleanup = cleanup
 pdb.xpm = xpm
 pdb.set_none = set_none
+pdb.inject_debug = inject_debug
+pdb.remove_debug = remove_debug
+pdb.show_debug = show_debug
 
 
 def print_pdb_continue_line():
