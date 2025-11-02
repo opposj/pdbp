@@ -133,6 +133,7 @@ setup(
         "tabcompleter>=1.4.0",
         'colorama>=0.4.6;platform_system=="Windows"',
         'objprint<=0.3.0',
+        'ipython<=8.37.0',
     ],
     setup_requires=[],
     include_package_data=True,

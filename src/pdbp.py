@@ -26,14 +26,17 @@ import subprocess
 import termios
 import pty
 import tty
-import readline  # To ensure the Python readline hook go first
+import atexit
+import time
+import objprint
+import stat
+
+# To ensure the Python readline hook go first
+import readline  
 if not os.environ.get("_PDB_W_MT", ""):
     import csrc._rl_patch as _rl_patch
 else:
     import csrc._rl_patch_mt as _rl_patch
-import atexit
-import time
-import objprint
 
 try:
     from pygments.styles.zenburn import ZenburnStyle 
@@ -42,21 +45,22 @@ try:
     class DesertStyle(ZenburnStyle):
         styles = {
             **ZenburnStyle.styles,
-            Token: '#ffffff',
+            Token.Text: '#ffffff',
 
-            Keyword: '#d7d787',
-            Keyword.Type: '#87ff87',
-            Keyword.Constant: '#87ff87',
-            Keyword.Declaration: '#d7d787',
-            Keyword.Namespace: '#d75f5f',
-            Keyword.Reserved: '#d7d787',
+            Keyword: '#d7d787 bold',
+            Keyword.Type: '#87ff87 nobold',
+            Keyword.Constant: '#87ff87 nobold',
+            Keyword.Declaration: '#d7d787 bold',
+            Keyword.Namespace: '#d75f5f nobold',
+            Keyword.Reserved: '#d7d787 bold',
+            Keyword.Pseudo: '#d7d787 nobold',
 
             Name: '#ffffff',
-            Name.Class: '#afaf5f',
+            Name.Class: '#afaf5f bold',
             Name.Function: '#87ff87',
             Name.Builtin: '#87ff87',
             Name.Builtin.Pseudo: '#87ff87',
-            Name.Exception: '#afaf5f',
+            Name.Exception: '#afaf5f bold',
             Name.Decorator: '#87ff87',
 
             Literal: '#ffafaf',
@@ -71,9 +75,15 @@ try:
             Operator: '#ffffff',
 
             Punctuation: '#ffffff',
-
+    
             Comment: '#5fd7ff',
             Comment.Multiline: '#ffafaf',
+            
+            # For IPython
+            Token.Prompt: '#ffffff', 
+            Token.PromptNum: '#87ff87',
+            Token.OutPrompt: '#ffffff',
+            Token.OutPromptNum: '#ffafaf',
         }
 
 except ImportError:
@@ -89,6 +99,9 @@ side_effects_free = re.compile(r"^ *[_0-9a-zA-Z\[\].]* *$")
 _pdb_lock = threading.Lock()
 _readline_lock = threading.Lock()
 _inject_lock = threading.Lock()
+_ipython_enabled = False
+_ipython_nested = False
+_ipython_cfg = None
 
 
 def import_from_stdlib(name):
@@ -157,15 +170,6 @@ def set_line_width(line, width, tll=True):
     return "%s%s" % (new_line, extra_spaces)
 
 
-def get_terminal_size():
-    if "linux" in sys.platform:
-        return shutil.get_terminal_size((80, 20))
-    try:
-        return os.get_terminal_size()
-    except Exception:
-        return shutil.get_terminal_size((80, 20))
-
-
 class DefaultConfig(object):
     if "win32" in sys.platform:
         import colorama
@@ -178,7 +182,8 @@ class DefaultConfig(object):
     colorscheme = None
     style = DesertStyle
     use_terminal256formatter = True  # Defaults to `"256color" in $TERM`.
-    editor = "${EDITOR:-vim}"  # Use $EDITOR if set; else default to vi.
+    editor = "${EDITOR:-vim} +<lineno> <filename>"  # Use $EDITOR if set; else default to vim.
+    ipython_editor = "vim"
     stdin_paste = None
     exec_if_unfocused = None  # This option was removed!
     truncate_long_lines = False
@@ -187,21 +192,21 @@ class DefaultConfig(object):
     enable_hidden_frames = False
     show_hidden_frames_count = False
     encodings = ("utf-8", "latin-1")
-    filename_color = Color.fuchsia
+    filename_color = "38;5;167"
     line_number_color = "38;5;226" 
-    regular_stack_color = Color.turquoise
-    pm_stack_color = Color.red
+    regular_stack_color = "38;5;120" 
+    pm_stack_color = "38;5;217"
     stack_color = regular_stack_color
     # https://en.wikipedia.org/wiki/ANSI_escape_code#3-bit_and_4-bit
-    return_value_color = "90;1"  # Gray
-    pm_return_value_color = "31;1"  # Red (Post Mortem failure)
-    num_return_value_color = "95;1"  # Bright Magenta (numbers)
-    true_return_value_color = "32;1"  # Green
-    false_return_value_color = "33;1"  # Yellow (red was taken)
-    none_return_value_color = "33;1"  # Yellow (same as False)
-    regular_line_color = "97;44;1"  # White on Blue (Old: "39;49;7")
-    pm_cur_line_color = "97;41;1"  # White on Red (Post Mortem Color)
-    exc_line_color = "31;103;1"  # Red on Yellow (Exception-handling)
+    return_value_color = "38;5;231;1"  # Gray
+    pm_return_value_color = return_value_color  # Red (Post Mortem failure)
+    num_return_value_color = return_value_color  # Bright Magenta (numbers)
+    true_return_value_color = return_value_color  # Green
+    false_return_value_color = return_value_color  # Yellow (red was taken)
+    none_return_value_color = return_value_color  # Yellow (same as False)
+    regular_line_color = "97;48;5;67;1"  # White on Blue (Old: "39;49;7")
+    pm_cur_line_color = "97;48;5;133;1"  # White on Red (Post Mortem Color)
+    exc_line_color = "38;5;16;48;5;144"  # Red on Yellow (Exception-handling)
     current_line_color = regular_line_color
     exception_caught = False
     last_return_color = None
@@ -209,10 +214,13 @@ class DefaultConfig(object):
     show_traceback_on_error_limit = None
     default_pdb_kwargs = {
     }
-    external_print_tmp_dir = "~/.pdbp_ep_cache"
+    post_mortem_restart = False
+    external_print_tmp_dir = "~/.pdbp_cache"
     external_print_prefix = "eval"
     external_print_postfix = ".py"
     external_print_cache_limit = -1
+    external_print_cmd = "vim -c 'term ++close ++curwin less -R <filename>'"
+    external_print_subfix = "_sub"
 
     def setup(self, pdb):
         pass
@@ -354,11 +362,11 @@ def _new_thread_run(self):
 
     return rt
 
-
-_thread_list = []
-_ori_thread_run = threading.Thread.run
-threading.Thread.run = _new_thread_run 
-_atexit_registered = 0
+if __name__ != "__main__":
+    _thread_list = []
+    _ori_thread_run = threading.Thread.run
+    threading.Thread.run = _new_thread_run 
+    _atexit_registered = 0
         
 
 class _TLocalTextIOWrapper(threading.local):
@@ -459,8 +467,8 @@ def _stdio_clean():
 class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     DefaultConfig = DefaultConfig
     config_filename = ".pdbrc.py"
-
-    def __init__(self, *args, **kwds):
+    
+    def __basic_init__(self, *args, **kwds):
         self.ConfigFactory = kwds.pop("Config", None)
         self.start_lineno = kwds.pop("start_lineno", None)
         self.start_filename = kwds.pop("start_filename", None)
@@ -485,9 +493,30 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         self._hidden_frames = []
         self.saved_curframe = None
         self.last_cmd = None
-        self._ep_counter = 0
         self._thread_id = _thread.get_native_id()
+        self._ep_counter = 0
         self._ep_path = os.path.expanduser(os.path.join(self.config.external_print_tmp_dir, str(self._thread_id)))
+
+    def __sub_init__(self, *args, **kwds):
+        parent = kwds.pop("parent", None)
+        assert parent
+        self.__basic_init__(*args, **kwds)
+        self._ep_map = parent._ep_map
+
+        if not os.environ.get("_PDB_DISABLE_PTY", ""):
+            self.parent = parent
+            self.master, self.slave = parent.master, parent.slave
+            self.old_stdin, self.old_stdout, self.old_stderr = parent.old_stdin, parent.old_stdout, parent.old_stderr
+            self.stdin, self.stdout, self.stderr = parent.stdin, parent.stdout, parent.stderr
+            self.io_pty = parent.io_pty
+
+        if hasattr(self, "old_stdin"):
+            if os.environ.get("_PDB_W_MT", ""):
+                self.stdin.readline = _rl_patch.pty_readline
+            self.cmdqueue.append("_ext_pty")
+    
+    def __init__(self, *args, **kwds):
+        self.__basic_init__(*args, **kwds)
         self._ep_map = {}
 
         global _atexit_registered
@@ -515,7 +544,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
 
             _rl_patch.patch_hook(self.master)
             self.io_pty = True
-        
+
         self.stdout = self.ensure_file_can_write_unicode(self.stdout)
 
         global _thread_list
@@ -528,6 +557,55 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 self.cmdqueue.append("_acquire")
             else:
                 self.stdin.readline = _rl_patch.pty_readline
+            self.cmdqueue.append("_ext_pty")
+
+    def _another_tty_init(self, master):
+        termios.tcsetattr(master, termios.TCSANOW, termios.tcgetattr(sys.stdin._ori_stream))
+        attrs = termios.tcgetattr(master)
+        attrs[3] = attrs[3] & ~termios.ECHO
+        attrs[3] = attrs[3] & ~termios.ICANON
+        attrs[1] = attrs[1] & ~termios.OPOST
+        termios.tcsetattr(master, termios.TCSANOW, attrs)
+
+    def _load_ext_pty(self, line):
+        if hasattr(self, "_ext_stdin"):
+            self._ext_stdin.close()
+        if hasattr(self, "_ext_stdout"):
+            self._ext_stdout.close()
+        self._ext_pty = line
+        with open(line, "w") as f:
+            fd = f.fileno()
+            self._ext_stdin = open(os.dup(fd), "r")
+            self._ext_stdout = open(os.dup(fd), "w")
+            self._ext_stderr = self._ext_stdout
+        self.stdout.write(CLEARSCREEN)
+        self.print_stack_entry(self.stack[self.curindex])
+
+    def _istty(self, line):
+        try:
+            mode = os.stat(line).st_mode
+            if stat.S_ISCHR(mode):
+                return True
+        except Exception:
+            return False
+
+    def do__ext_pty(self, arg):
+        if hasattr(self, "_ext_pty"):
+            return
+        if hasattr(self, "parent"):
+            self._ext_pty = self.parent._ext_pty
+            self._ext_stdin, self._ext_stdout, self._ext_stderr = self.parent._ext_stdin, self.parent._ext_stdout, self.parent._ext_stderr
+            return
+        _ext_pty = input()
+        assert(self._istty(_ext_pty))
+        self._load_ext_pty(_ext_pty)
+
+    def do_clean(self, arg):
+        """ clean
+        
+        Clear the screen.
+        """
+        self.stdout.write(CLEARSCREEN)
 
     def do_EOF(self, arg):
         try:
@@ -538,6 +616,13 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     do_EOF.__doc__ = pdb.Pdb.do_EOF.__doc__
 
     def do_ext_print(self, arg):
+        if arg in self._ep_map:
+            tmp_path = os.path.join(self._ep_path, arg)
+            if not os.path.exists(tmp_path):
+                print(f"Cached `{tmp_path}` is already removed. Display cancelled")
+            else:
+                subprocess.call(self.config.external_print_cmd.replace('<filename>', tmp_path), shell=True, **self._choose_ext_stdio())
+            return
         try:
             var = eval(arg, self.curframe.f_globals, self.curframe_locals)
         except Exception:
@@ -561,9 +646,8 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 os.makedirs(self._ep_path)
             with open(tmp_path, "w") as f:
                 objprint.op(var, file=f)
-            # subprocess.call(f"{self.config.editor} -c 'term ++curwin bash -c \"cat {tmp_path} | less -R\"'", shell=True, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr)
-            subprocess.call(f"{self.config.editor} -c 'echo &columns .. \" \" .. &lines'", shell=True, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr)
-            print(os.path.join(str(self._thread_id), tmp_name), file=self.stdout)
+            subprocess.call(self.config.external_print_cmd.replace('<filename>', tmp_path), shell=True, **self._choose_ext_stdio())
+            print(tmp_name, file=self.stdout)
         except Exception:
             print("Invalid print!", file=self.stdout)
             return
@@ -579,6 +663,57 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     """
 )
     do_ep = do_ext_print
+
+    def do_ipython(self, arg):
+        """ ipython
+
+        Launch an IPython interactive session based on current locals().
+        """
+        global _ipython_enabled, _ipython_nested, _ipython_cfg
+        if _ipython_enabled:
+            self._launch_ipython()
+        else:
+            from traitlets.config.loader import Config as IPythonConfig
+            try:
+                get_ipython
+            except NameError:
+                _ipython_nested = False
+            else:
+                _ipython_nested = True
+
+            _ipython_cfg = IPythonConfig()
+            _ipython_cfg.TerminalInteractiveShell.banner1 = ""
+            _ipython_cfg.TerminalInteractiveShell.banner2 = ""
+            _ipython_cfg.TerminalInteractiveShell.exit_msg = ""
+            _ipython_cfg.TerminalInteractiveShell.highlighting_style = self.config.style
+            _ipython_cfg.TerminalInteractiveShell.highlighting_style_overrides = {
+                Token.Prompt: self.config.style.styles[Token.Prompt], 
+                Token.PromptNum: self.config.style.styles[Token.PromptNum],
+                Token.OutPrompt: self.config.style.styles[Token.OutPrompt],
+                Token.OutPromptNum: self.config.style.styles[Token.OutPromptNum],
+            }
+            _ipython_cfg.TerminalInteractiveShell.confirm_exit = False
+            _ipython_cfg.TerminalInteractiveShell.editor = self.config.ipython_editor
+            _ipython_cfg.TerminalInteractiveShell.automagic = False
+            _ipython_cfg.TerminalInteractiveShell.xmode = "Plain"
+            _ipython_cfg.TerminalInteractiveShell.colors = "NoColor"
+            _ipython_enabled = True
+            self._launch_ipython()
+
+    def _launch_ipython(self):
+        from IPython.terminal.embed import InteractiveShellEmbed
+        self_stdout = getattr(self, "_ext_stdout", self.stdout)
+        tmp_sysout, sys.stdout = sys.stdout, self_stdout
+        tmp_out_fno = os.dup(1)
+        tmp_in_fno = os.dup(0)
+        os.dup2(self_stdout.fileno(), 1)
+        os.dup2(self.stdin.fileno(), 0)
+        InteractiveShellEmbed(config=_ipython_cfg, user_ns=self.curframe_locals)()
+        os.dup2(tmp_in_fno, 0)
+        os.close(tmp_in_fno)
+        os.dup2(tmp_out_fno, 1)
+        os.close(tmp_out_fno)
+        sys.stdout = tmp_sysout
 
     if not os.environ.get("_PDB_W_MT", ""):
         def do__acquire(self, arg):
@@ -672,6 +807,13 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         if self.io_pty:
             self._exchange_stdio()
 
+    def _choose_ext_stdio(self):
+        return {
+            "stdin": self.stdin if hasattr(self, "_ext_stdin") else self.old_stdin,
+            "stdout": getattr(self, "_ext_stdout", self.old_stdout),
+            "stderr": getattr(self, "_ext_stderr", self.old_stderr),
+        }
+
     def _exchange_stdio(self):
         if hasattr(self, "old_stdin"):
             self.stdin, self.old_stdin = self.old_stdin, self.stdin
@@ -711,6 +853,12 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
 
             self.stdout.flush() if self.io_pty else self.old_stdout.flush()
             time.sleep(0.1) # Ensure all output is transmitted 
+            
+            try:
+                self._ext_stdin.close() if hasattr(self, "_ext_stdin") else None
+                self._ext_stdout.close() if hasattr(self, "_ext_stdout") else None
+            except OSError:
+                pass
 
             try:
                 self.stdin.close() if self.io_pty else self.old_stdin.close()
@@ -721,6 +869,36 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
 
         _pdb_lock.release()
     
+    def get_terminal_size(self):
+        try:
+            f_o = getattr(self, "_ext_stdout", self.stdout)
+            return os.get_terminal_size(f_o.fileno())
+        except Exception:
+            if "linux" in sys.platform:
+                return shutil.get_terminal_size((80, 20))
+            try:
+                return os.get_terminal_size()
+            except Exception:
+                return shutil.get_terminal_size((80, 20))
+
+    def print_pdb_continue_line(self):
+        width, height = self.get_terminal_size()
+        pdb_continue = " PDB continue "
+        border_line = ">>>>>>>>%s>>>>>>>>" % pdb_continue
+        try:
+            terminal_size = width
+            if terminal_size < 30:
+                terminal_size = 30
+            border_len = terminal_size - len(pdb_continue)
+            border_left_len = int(border_len / 2)
+            border_right_len = int(border_len - border_left_len)
+            border_left = ">" * border_left_len
+            border_right = ">" * border_right_len
+            border_line = (border_left + pdb_continue + border_right)
+        except Exception:
+            pass
+        print("\n" + border_line + "\n", self.stdout)
+
     def _runmodule(self, module_name):
         import __main__
         import runpy
@@ -809,6 +987,8 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             self.has_traceback = False
             self.config.stack_color = self.config.regular_stack_color
             self.config.current_line_color = self.config.regular_line_color
+            if self.config.post_mortem_restart:
+                self.config.exception_caught = False
         if traceback or not self.sticky or self.first_time_sticky:
             if traceback:
                 self.has_traceback = True
@@ -1122,6 +1302,9 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             self.stdout.write("%-28s %s\n" % (formatted_key, value))
 
     def default(self, line):
+        if self._istty(line):
+            self._load_ext_pty(line)
+            return
         self.history.append(line)
         return super().default(line)
 
@@ -1226,7 +1409,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
         lines = [line.replace("\t", "    ")
                  for line in lines]  # force tabs to 4 spaces
         lines = [line.rstrip() for line in lines]
-        width, height = get_terminal_size()
+        width, height = self.get_terminal_size()
         width = width - offset
         height = height - 1
         overflow = 0
@@ -1374,7 +1557,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     do_p.__doc__ = pdb.Pdb.do_p.__doc__
 
     def do_pp(self, arg):
-        width, _ = get_terminal_size()
+        width, _ = self.get_terminal_size()
         try:
             pprint.pprint(self._getval(arg), self.stdout, width=width)
         except Exception:
@@ -1396,22 +1579,30 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     def do_debug(self, arg):
         self.last_cmd = self.lastcmd = "debug"
         Config = self.ConfigFactory
+        ori_globals = globals()
 
         class PdbpWithConfig(self.__class__):
             def __init__(self_withcfg, *args, **kwargs):
                 kwargs.setdefault("Config", Config)
-                super(PdbpWithConfig, self_withcfg).__init__(*args, **kwargs)
+                kwargs["parent"] = self
+                super(PdbpWithConfig, self_withcfg).__sub_init__(*args, **kwargs)
                 self_withcfg.use_rawinput = self.use_rawinput
-        do_debug_func = pdb.Pdb.do_debug
+                self_withcfg.config.external_print_prefix += self_withcfg.config.external_print_subfix
+                ori_globals["GLOBAL_PDB"] = self_withcfg
+        do_debug_func = super(self.__class__, self.__class__).do_debug
         newglobals = do_debug_func.__globals__.copy()
         newglobals["Pdb"] = PdbpWithConfig
         orig_do_debug = rebind_globals(do_debug_func, newglobals)
         try:
-            return orig_do_debug(self, arg)
+            rt = orig_do_debug(self, arg)
         except Exception:
             exc_info = sys.exc_info()[:2]
             msg = traceback.format_exception_only(*exc_info)[-1].strip()
             self.error(msg)
+        finally:
+            ori_globals["GLOBAL_PDB"] = self
+        return rt
+
     do_debug.__doc__ = pdb.Pdb.do_debug.__doc__
 
     def do_run(self, arg):
@@ -1845,7 +2036,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
 
     def _open_editor(self, editor, lineno, filename):
         filename = filename.replace('"', '\\"')
-        subprocess.call('%s "%s"' % (editor, filename), shell=True, stdin=self.stdin, stdout=self.stdout, stderr=self.stderr)
+        subprocess.call(editor.replace('<filename>', filename).replace('<lineno>', str(lineno)), shell=True, **self._choose_ext_stdio())
 
     def _get_current_position(self):
         frame = self.curframe
@@ -2090,25 +2281,6 @@ pdb.remove_debug = remove_debug
 pdb.show_debug = show_debug
 
 
-def print_pdb_continue_line():
-    width, height = get_terminal_size()
-    pdb_continue = " PDB continue "
-    border_line = ">>>>>>>>%s>>>>>>>>" % pdb_continue
-    try:
-        terminal_size = width
-        if terminal_size < 30:
-            terminal_size = 30
-        border_len = terminal_size - len(pdb_continue)
-        border_left_len = int(border_len / 2)
-        border_right_len = int(border_len - border_left_len)
-        border_left = ">" * border_left_len
-        border_right = ">" * border_right_len
-        border_line = (border_left + pdb_continue + border_right)
-    except Exception:
-        pass
-    print("\n" + border_line + "\n")
-
-
 def main():
     import getopt
     opts, args = getopt.getopt(sys.argv[1:], "mhc:", ["help", "command="])
@@ -2134,7 +2306,9 @@ def main():
         mainpyfile = os.path.realpath(mainpyfile)
         sys.path[0] = os.path.dirname(mainpyfile)
     _pdb_lock.acquire()
+    global GLOBAL_PDB
     pdb = Pdb()
+    GLOBAL_PDB = pdb
     _pdb_lock.release()
     pdb.rcLines.extend(commands)
     stay_in_pdb = True
@@ -2146,7 +2320,7 @@ def main():
                 pdb._runscript(mainpyfile)
             if pdb._user_requested_quit:
                 break
-            print_pdb_continue_line()
+            pdb.print_pdb_continue_line()
             stay_in_pdb = False
         except Restart:
             print("Restarting", mainpyfile, "with arguments:")
@@ -2170,11 +2344,16 @@ def main():
                 pass
             t = sys.exc_info()[2]
             pdb.interaction(None, t)
-            print_pdb_continue_line()
-            stay_in_pdb = False
+            pdb.print_pdb_continue_line()
+            if pdb.config.post_mortem_restart:
+                stay_in_pdb = True
+                pdb.config.exception_caught = True
+            else:
+                stay_in_pdb = False
 
 
 if __name__ == "__main__":
+    # Note! "pdbp.py" will be executed twice if launched as a module
     run_from_main = True
     import pdbp
     pdbp.main()
