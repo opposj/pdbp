@@ -674,6 +674,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             self._launch_ipython()
         else:
             from traitlets.config.loader import Config as IPythonConfig
+            from prompt_toolkit.styles import Style
             try:
                 get_ipython
             except NameError:
@@ -697,18 +698,25 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             _ipython_cfg.TerminalInteractiveShell.automagic = False
             _ipython_cfg.TerminalInteractiveShell.xmode = "Plain"
             _ipython_cfg.TerminalInteractiveShell.colors = "NoColor"
+            _ipython_cfg._pdbp_extra_style = Style.from_dict({
+                "matching-bracket.other": "#6c6c6c bg:#afaf5f",
+                "matching-bracket.cursor": "#f0f0f0 bg:#afaf5f",
+            })
             _ipython_enabled = True
             self._launch_ipython()
 
     def _launch_ipython(self):
         from IPython.terminal.embed import InteractiveShellEmbed
+        from prompt_toolkit.styles import merge_styles
         self_stdout = getattr(self, "_ext_stdout", self.stdout)
         tmp_sysout, sys.stdout = sys.stdout, self_stdout
         tmp_out_fno = os.dup(1)
         tmp_in_fno = os.dup(0)
         os.dup2(self_stdout.fileno(), 1)
         os.dup2(self.stdin.fileno(), 0)
-        InteractiveShellEmbed(config=_ipython_cfg, user_ns=self.curframe_locals)()
+        ip_shell = InteractiveShellEmbed(config=_ipython_cfg, user_ns=self.curframe_locals)
+        ip_shell.pt_app.style = merge_styles([ip_shell.style, _ipython_cfg._pdbp_extra_style])
+        ip_shell()
         os.dup2(tmp_in_fno, 0)
         os.close(tmp_in_fno)
         os.dup2(tmp_out_fno, 1)
@@ -1579,7 +1587,7 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
     def do_debug(self, arg):
         self.last_cmd = self.lastcmd = "debug"
         Config = self.ConfigFactory
-        ori_globals = globals()
+        ori_globals = getattr(self, "_ori_globals", globals())
 
         class PdbpWithConfig(self.__class__):
             def __init__(self_withcfg, *args, **kwargs):
@@ -1587,9 +1595,20 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 kwargs["parent"] = self
                 super(PdbpWithConfig, self_withcfg).__sub_init__(*args, **kwargs)
                 self_withcfg.use_rawinput = self.use_rawinput
-                self_withcfg.config.external_print_prefix += self_withcfg.config.external_print_subfix
+                self_withcfg.config.external_print_prefix = self.config.external_print_prefix + self_withcfg.config.external_print_subfix
+                self_withcfg._ori_globals = ori_globals
                 ori_globals["GLOBAL_PDB"] = self_withcfg
-        do_debug_func = super(self.__class__, self.__class__).do_debug
+        
+        for cls_ in self.__class__.__mro__[1:]:
+            do_debug_func = getattr(cls_, "do_debug", None)
+            if not do_debug_func:
+                continue
+            if do_debug_func.__module__ == "pdb":
+                break
+            else:
+                do_debug_func = None
+
+        assert(do_debug_func)
         newglobals = do_debug_func.__globals__.copy()
         newglobals["Pdb"] = PdbpWithConfig
         orig_do_debug = rebind_globals(do_debug_func, newglobals)
