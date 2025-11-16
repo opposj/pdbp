@@ -30,6 +30,9 @@ import atexit
 import time
 import objprint
 import stat
+import socketserver
+import json
+import warnings
 
 # To ensure the Python readline hook go first
 import readline  
@@ -221,6 +224,9 @@ class DefaultConfig(object):
     external_print_cache_limit = -1
     external_print_cmd = "vim -c 'term ++close ++curwin less -R <filename>'"
     external_print_subfix = "_sub"
+    serve_address = "localhost"
+    serve_port = 0 
+    serve_max_retry = 10
 
     def setup(self, pdb):
         pass
@@ -252,6 +258,10 @@ def lasti2lineno(code, lasti):
         if lasti >= i:
             return lineno
     return 0
+
+
+class PtyFetchError(RuntimeError): 
+    pass
 
 
 class Restart(Exception):
@@ -362,12 +372,46 @@ def _new_thread_run(self):
 
     return rt
 
+class _VimRequestDispatchMixIn: pass
+
+class _VimRequestHandler(_VimRequestDispatchMixIn socketserver.BaseRequestHandler):
+    def setup(self):
+        if _active_connection['socket']:
+            warnings.warn("A new connection is refused due to the survival of an existing connection", RuntimeWarning)
+            self.request.close()  
+            return
+        _active_connection['socket'] = self.request
+
+    def handle(self):
+        while True:
+            try:
+                data = self.request.recv(4096).decode('utf-8')
+            except socket.error:
+                break
+            if data == '':
+                break
+            try:
+                decoded = json.loads(data)
+            except ValueError:
+                continue
+            assert decoded[0] >= 0
+            if self._istty(decoded[1]):
+                _ext_pty = decoded[1]
+                self.request.sendall(json.dumps([decoded[0], "accepted"]).encode('utf-8'))
+                import time;time.sleep(10)
+                break
+
+    def finish(self):
+        if _active_connection['socket'] == self.request:
+            _active_connection['socket'] = None
+
 if __name__ != "__main__":
     _thread_list = []
     _ori_thread_run = threading.Thread.run
     threading.Thread.run = _new_thread_run 
     _atexit_registered = 0
-        
+    _vim_handler_thread = None
+    _active_connection = {'socket': None}
 
 class _TLocalTextIOWrapper(threading.local):
     _ori_stream: io.TextIOWrapper
@@ -525,6 +569,14 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             _atexit_registered = 1
 
         if not os.environ.get("_PDB_DISABLE_PTY", ""):
+            global _vim_handler_thread
+            if not _vim_handler_thread:
+                pass
+
+            self.vim_conn()
+            print(self._ext_pty)
+            exit()
+
             _stdio_set_tlocal()
             master, slave = pty.openpty()
             tty.setraw(master, termios.TCSANOW)
@@ -558,6 +610,49 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
             else:
                 self.stdin.readline = _rl_patch.pty_readline
             self.cmdqueue.append("_ext_pty")
+
+    def vim_conn(self):
+        _retry_counter = 0
+        while 1:
+            try:
+                _retry_counter += 1
+                self._ext_pty = self._get_remote_pty()
+            except PtyFetchError:
+                if _retry_counter > self.config.serve_max_retry:
+                    raise
+                continue
+            else:
+                break
+
+    def _get_remote_pty(self):
+        _ext_pty = None
+        class _handler(socketserver.BaseRequestHandler):
+            def handle(sock):
+                nonlocal _ext_pty
+                while True:
+                    try:
+                        data = sock.request.recv(4096).decode('utf-8')
+                    except socket.error:
+                        break
+                    if data == '':
+                        break
+                    try:
+                        decoded = json.loads(data)
+                    except ValueError:
+                        continue
+                    assert decoded[0] >= 0
+                    if self._istty(decoded[1]):
+                        _ext_pty = decoded[1]
+                        sock.request.sendall(json.dumps([decoded[0], "accepted"]).encode('utf-8'))
+                        import time;time.sleep(10)
+                        break
+        with socketserver.TCPServer((self.config.serve_address, self.config.serve_port), _handler) as server:
+            host, port = server.server_address
+            print(f"Process: {os.getpid()}, Thread: {self._thread_id}, Listen on {host}:{port}...")
+            server.handle_request()
+        if not _ext_pty:
+            raise PtyFetchError("Cannot fetch an available PTY for debugging!")
+        return _ext_pty
 
     def _another_tty_init(self, master):
         termios.tcsetattr(master, termios.TCSANOW, termios.tcgetattr(sys.stdin._ori_stream))
@@ -1598,17 +1693,8 @@ class Pdb(pdb.Pdb, ConfigurableClass, threading.local, object):
                 self_withcfg.config.external_print_prefix = self.config.external_print_prefix + self_withcfg.config.external_print_subfix
                 self_withcfg._ori_globals = ori_globals
                 ori_globals["GLOBAL_PDB"] = self_withcfg
-        
-        for cls_ in self.__class__.__mro__[1:]:
-            do_debug_func = getattr(cls_, "do_debug", None)
-            if not do_debug_func:
-                continue
-            if do_debug_func.__module__ == "pdb":
-                break
-            else:
-                do_debug_func = None
 
-        assert(do_debug_func)
+        do_debug_func = super().do_debug
         newglobals = do_debug_func.__globals__.copy()
         newglobals["Pdb"] = PdbpWithConfig
         orig_do_debug = rebind_globals(do_debug_func, newglobals)
